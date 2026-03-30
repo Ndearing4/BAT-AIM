@@ -1,0 +1,47 @@
+name: ARIA
+
+on:
+  schedule:
+    - cron: '0 13 * * *'   # 9:00 AM ET (UTC-5) — lineup
+    - cron: '0 10 * * *'   # 6:00 AM ET — waivers
+  workflow_dispatch:        # allows manual trigger from Actions tab
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: true
+        default: 'all'
+        type: choice
+        options: [all, lineup, waivers]
+
+jobs:
+  run-aria:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ARIA
+        env:
+          ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+          ESPN_TEAM_ID:   ${{ secrets.ESPN_TEAM_ID }}
+          ESPN_S2:        ${{ secrets.ESPN_S2 }}
+          ESPN_SWID:      ${{ secrets.ESPN_SWID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Determine mode based on which cron triggered
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "11" ]; then
+              python src/ai_manager.py waivers
+            else
+              python src/ai_manager.py lineup
+            fi
+          else
+            python src/ai_manager.py ${{ github.event.inputs.mode }}
+          fi
