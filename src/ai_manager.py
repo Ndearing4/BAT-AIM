@@ -25,20 +25,26 @@ SWID          = os.environ["ESPN_SWID"]                # ESPN auth cookie
 GEMINI_KEY    = os.environ["GEMINI_API_KEY"]
 YEAR          = datetime.now().year
 
+# ─── ROSTER CONFIG ─────────────────────────────────────────────────────────────
+# Hard-coded active hitter slots for this league. Update if league settings change.
+# List each slot once per slot that exists (e.g. three OF slots → three "OF" entries).
+# Pitchers are handled separately — do NOT include SP/RP/P here.
+HITTER_SLOTS = ["C", "1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"]
+
 # ─── MOCK CONFIG ───────────────────────────────────────────────────────────────
 # Set USE_LLM = False to skip Gemini entirely and use the mock responses below.
 # Useful for testing ESPN API calls without burning quota.
 # Swap in real player names from your roster/waiver wire before running.
-USE_LLM = False
+USE_LLM = True
 
 MOCK_LINEUP_RESPONSE = """
-ACTIVE: Adley Rutschman, Vinnie Pasquantino, Jazz Chisholm Jr., Jose Ramirez, Masyn Winn, Riley Greene, Bryan Reynolds, Wyatt Langford, Kyle Schwarber
-BENCH: Bryce Harper, Tyler Stephenson, Kyle Tucker
+ACTIVE: Adley Rutschman, Bryce Harper, Jazz Chisholm Jr., Jose Ramirez, Masyn Winn, Riley Greene, Wyatt Langford, Kyle Schwarber
+BENCH: Vinnie Pasquantino, Tyler Stephenson, Bryan Reynolds, Kyle Tucker
 REASONING: Mock lineup for ESPN API testing — swapping Kyle Tucker to bench in favour of Riley Greene.
 """
 
 MOCK_WAIVER_RESPONSE = """
-NO MOVES
+ADD: Brandon Lowe | DROP: Jazz Chisholm Jr. | REASON: Mock waiver claim
 """
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -59,6 +65,35 @@ def get_league() -> League:
     return League(league_id=LEAGUE_ID, year=YEAR, espn_s2=ESPN_S2, swid=SWID)
 
 
+def can_fill_all_slots(hitters: list, slots: list[str]) -> bool:
+    """Return True if `hitters` can fill every slot in `slots` without conflicts.
+
+    Uses augmenting-path bipartite matching. Each hitter may fill at most one
+    slot; a slot is fillable if the hitter's eligibleSlots contains its name.
+    """
+    player_for_slot = [None] * len(slots)
+
+    def augment(slot_idx: int, visited: set) -> bool:
+        for p_idx, player in enumerate(hitters):
+            if slots[slot_idx] not in player.eligibleSlots:
+                continue
+            try:
+                taken = player_for_slot.index(p_idx)
+            except ValueError:
+                taken = None
+            if taken is None:
+                player_for_slot[slot_idx] = p_idx
+                return True
+            if taken not in visited:
+                visited.add(taken)
+                if augment(taken, visited):
+                    player_for_slot[slot_idx] = p_idx
+                    return True
+        return False
+
+    return all(augment(i, {i}) for i in range(len(slots)))
+
+
 def serialize_player(p, include_stats=True) -> dict:
     """Convert ESPN player object to a clean dict for the AI."""
     d = {
@@ -77,11 +112,31 @@ def serialize_player(p, include_stats=True) -> dict:
 
 def build_lineup_prompt(team, league) -> str:
     roster = [serialize_player(p) for p in team.roster]
-    
+
+    from collections import Counter
+
+    pitcher_slots = {"SP", "RP", "P"}
+    slot_order    = ["C", "1B", "2B", "3B", "SS", "OF", "UTIL"]
+
+    hitters = [p for p in team.roster if not set(p.eligibleSlots) & pitcher_slots]
+
+    # Use hard-coded HITTER_SLOTS config instead of deriving from current roster
+    # state, which is unreliable when players happen to be sitting on the bench.
+    total_hitter_slots  = len(HITTER_SLOTS)
+    total_bench_slots   = len(hitters) - total_hitter_slots
+    total_pitcher_slots = sum(1 for p in team.roster if p.lineupSlot in pitcher_slots)
+
+    active_slot_counts = Counter(HITTER_SLOTS)
+    slot_summary = ", ".join(
+        f"{active_slot_counts[slot]}x {slot}" if active_slot_counts.get(slot, 0) > 1 else slot
+        for slot in slot_order
+        if active_slot_counts.get(slot, 0) > 0
+    )
+
     # Get this week's matchup opponent
     current_week = league.currentMatchupPeriod
     matchup = next(
-        (m for m in league.box_scores(current_week) 
+        (m for m in league.box_scores(current_week)
          if m.home_team.team_id == TEAM_ID or m.away_team.team_id == TEAM_ID),
         None
     )
@@ -90,6 +145,14 @@ def build_lineup_prompt(team, league) -> str:
         opp = matchup.away_team if matchup.home_team.team_id == TEAM_ID else matchup.home_team
         opponent_info = f"This week's opponent: {opp.team_name} (record: {opp.wins}-{opp.losses})"
 
+    # Build hitter table: name | eligible positions | has game today
+    hitter_lines = []
+    for p in hitters:
+        eligible = [s for s in slot_order if s in p.eligibleSlots]
+        playing  = "✓" if not p.injured and getattr(p, "injuryStatus", "ACTIVE") == "ACTIVE" else "✗"
+        hitter_lines.append(f"  {p.name:<25} eligible: {', '.join(eligible):<20} playing today: {playing}")
+    hitter_table = "\n".join(hitter_lines)
+
     return f"""
 {GM_PERSONA}
 
@@ -97,14 +160,27 @@ Today is {date.today().strftime('%A, %B %d, %Y')}.
 League format: Head-to-Head Points
 {opponent_info}
 
-Current roster:
+Available hitter slots: {slot_summary}
+(Pitchers fill {total_pitcher_slots} P slots and will be handled separately — do NOT include them.)
+
+Hitters on your roster:
+{hitter_table}
+
+Full roster stats (for reference):
 {json.dumps(roster, indent=2)}
 
-Task: Decide which players should be active vs on the bench today.
+Task: Choose exactly {total_hitter_slots} hitters to start and exactly {total_bench_slots} to bench.
+
+Rules you MUST follow:
+- Your {total_hitter_slots} ACTIVE hitters must be assignable to the available slots above with no conflicts.
+  For example, if there is only 1x 1B slot, you cannot start two pure-1B players — one must be eligible
+  for another slot (UTIL) or be benched.
+- Every hitter must appear in exactly one list — {total_hitter_slots} ACTIVE, {total_bench_slots} BENCH.
+- Prefer players with a game today (marked ✓) over those without (marked ✗).
 
 Respond with exactly this structure and nothing else:
-ACTIVE: Player Name, Player Name, Player Name, ...
-BENCH: Player Name, Player Name, ...
+ACTIVE: Player Name, Player Name, ... (exactly {total_hitter_slots} names)
+BENCH: Player Name, Player Name, ... (exactly {total_bench_slots} names)
 REASONING: One or two sentences explaining the key decisions.
 
 Only use player names exactly as they appear above. Do not add any other text.
@@ -112,14 +188,32 @@ Only use player names exactly as they appear above. Do not add any other text.
 
 
 def build_waiver_prompt(team, league) -> str:
-    roster      = [serialize_player(p) for p in team.roster]
-    free_agents = [serialize_player(p) for p in league.free_agents(size=25)]
+    pitcher_slots = {"SP", "RP", "P"}
+    hitters       = [p for p in team.roster if not set(p.eligibleSlots) & pitcher_slots]
+    roster        = [serialize_player(p) for p in team.roster]
+    free_agents   = [serialize_player(p) for p in league.free_agents(size=25)]
+
+    # Identify positional anchors: slots where only one hitter is eligible.
+    # Dropping that player would leave the slot permanently unfillable.
+    anchor_lines = []
+    for slot in set(HITTER_SLOTS):
+        eligible = [p for p in hitters if slot in p.eligibleSlots]
+        if len(eligible) == 1:
+            anchor_lines.append(f"  {slot}: {eligible[0].name} (only eligible player — do NOT drop)")
+    anchor_section = (
+        "Positional anchors — dropping these creates an unfillable hole:\n" + "\n".join(anchor_lines)
+        if anchor_lines else "No positional anchors — all slots have multiple eligible players."
+    )
 
     return f"""
 {GM_PERSONA}
 
 Today is {date.today().strftime('%A, %B %d, %Y')}.
 League format: Head-to-Head Points
+
+Active hitter slots: {", ".join(HITTER_SLOTS)}
+
+{anchor_section}
 
 Current roster:
 {json.dumps(roster, indent=2)}
@@ -129,6 +223,7 @@ Top 25 available free agents:
 
 Task: Recommend up to 3 waiver/free-agent moves that would improve our team.
 Only suggest moves that are clear upgrades. Prefer SP streamers with starts this week.
+Never drop a positional anchor unless the player being added can also fill that slot.
 If no moves are worthwhile, say: NO MOVES
 
 Otherwise respond with exactly this structure and nothing else:
@@ -172,7 +267,7 @@ def ask_gemini(prompt: str, mode: str = "lineup", retries: int = 3) -> str:
     for attempt in range(retries):
         try:
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-3.1-flash-lite-preview",
                 contents=prompt,
             )
             return response.text.strip()
@@ -323,21 +418,33 @@ def apply_lineup(team, league, raw_response: str):
     # ── Helpers ────────────────────────────────────────────────────────────
     pitcher_slots = {"SP", "RP", "P"}
     active_slots  = set(SLOT_PRIORITY)  # everything except BE / IL
-
+    
     def is_pitcher(player) -> bool:
         return bool(set(player.eligibleSlots) & pitcher_slots)
+    
+    total_OF_slots = HITTER_SLOTS.count("OF")
 
     def find_open_slot(player, occupied: set[str]) -> str | None:
+        # Count how many OF slots are already occupied in the current assignment
+        of_used = occupied.count("OF") if hasattr(occupied, "count") else sum(1 for s in occupied if s == "OF")
         for slot in SLOT_PRIORITY:
-            if slot in player.eligibleSlots and slot not in occupied:
+            if slot not in player.eligibleSlots:
+                continue
+            if slot == "OF":
+                # OF can be occupied multiple times up to total_OF_slots
+                if of_used < total_OF_slots:
+                    return slot
+            elif slot not in occupied:
                 return slot
         return None
+
 
     # Track which active slots are occupied as we go
     occupied: set[str] = {
         slot for name, slot in current_slot_by_name.items()
         if slot in active_slots
     }
+
 
     # ── Phase 1: bench outgoing hitters ────────────────────────────────────
     print("Phase 1: benching outgoing players...")
@@ -403,44 +510,44 @@ def apply_lineup(team, league, raw_response: str):
     _submit(phase3, scoring_period, "promote from bench")
 
     # ── Pitcher pass: bench non-starters, promote starters ─────────────────
-    # print("Pitcher pass: optimising P slots...")
-    # pitchers = [p for p in team.roster if is_pitcher(p)]
+    print("Pitcher pass: optimising P slots...")
+    pitchers = [p for p in team.roster if is_pitcher(p)]
 
-    # # A pitcher is "starting today" if their proTeamId appears as the home/away
-    # # starter — use the injuryStatus field as a proxy: ESPN marks non-starters
-    # # as "DTDAY" or similar, but the most reliable signal available without a
-    # # separate schedule API call is whether the player has a game today
-    # # (p.injured == False and status == "ACTIVE"). Flag starters vs non-starters:
-    # starters     = [p for p in pitchers if not p.injured and
-    #                 getattr(p, "injuryStatus", "ACTIVE") == "ACTIVE"]
-    # non_starters = [p for p in pitchers if p not in starters]
+    # A pitcher is "starting today" if their proTeamId appears as the home/away
+    # starter — use the injuryStatus field as a proxy: ESPN marks non-starters
+    # as "DTDAY" or similar, but the most reliable signal available without a
+    # separate schedule API call is whether the player has a game today
+    # (p.injured == False and status == "ACTIVE"). Flag starters vs non-starters:
+    starters     = [p for p in pitchers if not p.injured and
+                    getattr(p, "injuryStatus", "ACTIVE") == "ACTIVE"]
+    non_starters = [p for p in pitchers if p not in starters]
 
-    # # Bench any non-starters currently in active P slots
-    # pitcher_phase1 = []
-    # for p in non_starters:
-    #     slot = current_slot_by_name.get(p.name, "BE")
-    #     if slot != "BE":
-    #         pitcher_phase1.append(_make_move(p, slot, "BE"))
-    #         occupied.discard(slot)
-    #         current_slot_by_name[p.name] = "BE"
-    #         print(f"   {p.name}: {slot} → BE (not starting)")
-    # _submit(pitcher_phase1, scoring_period, "bench non-starting pitchers")
+    # Bench any non-starters currently in active P slots
+    pitcher_phase1 = []
+    for p in non_starters:
+        slot = current_slot_by_name.get(p.name, "BE")
+        if slot != "BE":
+            pitcher_phase1.append(_make_move(p, slot, "BE"))
+            occupied.discard(slot)
+            current_slot_by_name[p.name] = "BE"
+            print(f"   {p.name}: {slot} → BE (not starting)")
+    _submit(pitcher_phase1, scoring_period, "bench non-starting pitchers")
 
-    # # Promote starters sitting on the bench into open P slots
-    # pitcher_phase2 = []
-    # for p in starters:
-    #     if current_slot_by_name.get(p.name) == "BE":
-    #         target = find_open_slot(p, occupied)
-    #         if target:
-    #             pitcher_phase2.append(_make_move(p, "BE", target))
-    #             occupied.add(target)
-    #             current_slot_by_name[p.name] = target
-    #             print(f"   {p.name}: BE → {target} (starting today)")
-    #         else:
-    #             print(f"⚠️  No open P slot for starter {p.name}")
-    # _submit(pitcher_phase2, scoring_period, "promote starting pitchers")
+    # Promote starters sitting on the bench into open P slots
+    pitcher_phase2 = []
+    for p in starters:
+        if current_slot_by_name.get(p.name) == "BE":
+            target = find_open_slot(p, occupied)
+            if target:
+                pitcher_phase2.append(_make_move(p, "BE", target))
+                occupied.add(target)
+                current_slot_by_name[p.name] = target
+                print(f"   {p.name}: BE → {target} (starting today)")
+            else:
+                print(f"⚠️  No open P slot for starter {p.name}")
+    _submit(pitcher_phase2, scoring_period, "promote starting pitchers")
 
-    # print(f"✅ Lineup complete. Reasoning: {decision['reasoning']}")
+    print(f"✅ Lineup complete. Reasoning: {decision['reasoning']}")
 
 
 def parse_waiver_response(raw: str) -> list[dict]:
@@ -466,6 +573,40 @@ def parse_waiver_response(raw: str) -> list[dict]:
     return moves
 
 
+def espn_add_drop(add_player, drop_player, scoring_period: int):
+    """POST a free-agent add + drop transaction directly to the ESPN write API.
+
+    Payload format confirmed from DevTools. If the player is still within the
+    waiver window ESPN will return 400 — change both the top-level `type` and
+    the add-item `type` to "WAIVER" in that case.
+    """
+    url = (
+        f"https://lm-api-writes.fantasy.espn.com/apis/v3/games/flb"
+        f"/seasons/{YEAR}/segments/0/leagues/{LEAGUE_ID}/transactions/"
+    )
+    cookies = {"espn_s2": ESPN_S2, "SWID": SWID}
+    headers = {"Content-Type": "application/json"}
+
+    payload = {
+        "isLeagueManager": False,
+        "teamId":          TEAM_ID,
+        "type":            "FREEAGENT",
+        "memberId":        SWID,
+        "scoringPeriodId": scoring_period,
+        "executionType":   "EXECUTE",
+        "items": [
+            {"playerId": add_player.playerId,  "type": "ADD",  "toTeamId":   TEAM_ID},
+            {"playerId": drop_player.playerId, "type": "DROP", "fromTeamId": TEAM_ID},
+        ],
+    }
+
+    resp = requests.post(url, json=payload, cookies=cookies, headers=headers)
+    print(f"   ESPN response {resp.status_code} — add {add_player.name} / drop {drop_player.name}")
+    print(resp.text)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def apply_waivers(team, league, raw_response: str):
     """Parse Gemini's waiver recommendations and apply moves to ESPN."""
     moves = parse_waiver_response(raw_response)
@@ -476,8 +617,10 @@ def apply_waivers(team, league, raw_response: str):
 
     # Cache free agents once rather than re-fetching per move
     available = league.free_agents(size=200)
+    scoring_period = league.current_week
 
     for move in moves:
+        
         add_name  = move["add"]
         drop_name = move["drop"]
         reason    = move["reason"]
@@ -485,11 +628,23 @@ def apply_waivers(team, league, raw_response: str):
         add_player  = next((p for p in available if p.name == add_name), None)
         drop_player = next((p for p in team.roster if p.name == drop_name), None)
 
-        if add_player and drop_player:
-            team.add_player(add_player, drop_player)
-            print(f"✅ Added {add_name}, dropped {drop_name}. Reason: {reason}")
-        else:
+        if not add_player or not drop_player:
             print(f"⚠️  Could not execute move: Add {add_name} / Drop {drop_name} — player not found.")
+            continue
+
+        # Validate that the post-move roster can still fill all hitter slots.
+        pitcher_slots  = {"SP", "RP", "P"}
+        post_move_hitters = [
+            p for p in team.roster
+            if not set(p.eligibleSlots) & pitcher_slots and p.name != drop_name
+        ] + [add_player]
+        if not can_fill_all_slots(post_move_hitters, HITTER_SLOTS):
+            print(f"⛔ Rejected: dropping {drop_name} would leave a slot unfillable "
+                  f"that {add_name} cannot cover.")
+            continue
+
+        espn_add_drop(add_player, drop_player, scoring_period)
+        print(f"✅ Added {add_name}, dropped {drop_name}. Reason: {reason}")
 
 
 def run(mode: str = "all"):
@@ -502,7 +657,18 @@ def run(mode: str = "all"):
     league = get_league()
     team   = next(t for t in league.teams if t.team_id == TEAM_ID)
     print(f"📋 Managing: {team.team_name}")
+    
+    if mode in ("waivers", "all"):
+        print("🧠 Asking Gemini for waiver recommendations...")
+        waiver_prompt    = build_waiver_prompt(team, league)
+        waiver_response  = ask_gemini(waiver_prompt, mode="waivers")
+        print(waiver_response)
+        apply_waivers(team, league, waiver_response)
 
+    if mode == "all":
+        print("⏳ Waiting 15s before waiver call...")
+        time.sleep(15)
+    
     if mode in ("lineup", "all"):
         print("🧠 Asking Gemini for lineup decisions...")
         lineup_prompt    = build_lineup_prompt(team, league)
@@ -510,16 +676,7 @@ def run(mode: str = "all"):
         print(lineup_response)
         apply_lineup(team, league, lineup_response)
 
-    if mode == "all":
-        print("⏳ Waiting 15s before waiver call...")
-        time.sleep(15)
 
-    if mode in ("waivers", "all"):
-        print("🧠 Asking Gemini for waiver recommendations...")
-        waiver_prompt    = build_waiver_prompt(team, league)
-        waiver_response  = ask_gemini(waiver_prompt, mode="waivers")
-        print(waiver_response)
-        apply_waivers(team, league, waiver_response)
 
     print("✅ ARIA run complete.")
 
