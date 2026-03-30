@@ -1,0 +1,5 @@
+MOCK_LINEUP_RESPONSE = """
+ACTIVE: Adley Rutschman, Vinnie Pasquantino, Jazz Chisholm Jr., Jose Ramirez, Masyn Winn, Riley Greene, Bryan Reynolds, Wyatt Langford, Kyle Schwarber
+BENCH: Bryce Harper, Tyler Stephenson, Kyle Tucker
+REASONING: Mock lineup for ESPN API testing — swapping Kyle Tucker to bench in favour of Riley Greene.
+"""
