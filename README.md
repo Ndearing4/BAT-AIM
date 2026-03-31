@@ -74,11 +74,19 @@ git remote add origin https://github.com/YOUR_USERNAME/fantasy-baseball-ai.git
 git push -u origin main
 ```
 
-### 2. Add GitHub Secrets
+### 2. Create a GitHub Environment
 
-Go to your repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+The workflow targets a GitHub environment named **`runner`**, which is where your secrets must be stored (environment secrets take precedence over repository secrets and can have additional protection rules).
 
-Add these 5 secrets:
+1. Go to your repo → **Settings** → **Environments** → **New environment**
+2. Name it exactly **`runner`** and click **Configure environment**
+3. Optionally add protection rules (e.g. require a reviewer before the environment is used)
+
+### 3. Add Secrets to the Environment
+
+Inside the **`runner`** environment you just created, scroll to **Environment secrets** → **Add secret**
+
+Add all 5 secrets:
 
 | Secret Name | Value |
 |---|---|
@@ -88,13 +96,17 @@ Add these 5 secrets:
 | `ESPN_SWID` | Your `SWID` cookie value (include curly braces) |
 | `GEMINI_API_KEY` | Your Gemini API key |
 
-### 3. Enable GitHub Actions
+> **Environment vs repository secrets:** Secrets added at the repository level (Settings → Secrets and variables → Actions) will **not** be picked up by this workflow because it specifies `environment: runner`. Secrets must be added inside the environment itself.
+
+### 4. Enable GitHub Actions
 
 Go to your repo → **Actions** tab → click **"I understand my workflows, go ahead and enable them"**
 
 ARIA will automatically:
-- Set the optimal lineup every morning at 9:30 AM ET
-- Check the waiver wire every morning at 6:00 AM ET
+- Check the waiver wire every morning at **6:00 AM ET**
+- Set the optimal lineup every morning at **9:00 AM ET**
+
+> **Note:** GitHub Actions schedules run on UTC. Times above assume EDT (UTC−4, approximately March–November). During EST (UTC−5, November–March) the runs will be one hour later.
 
 ---
 
