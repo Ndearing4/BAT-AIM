@@ -43,6 +43,12 @@ BENCH: Vinnie Pasquantino, Tyler Stephenson, Bryan Reynolds, Kyle Tucker
 REASONING: Mock lineup for ESPN API testing — swapping Kyle Tucker to bench in favour of Riley Greene.
 """
 
+MOCK_PITCHER_RESPONSE = """
+ROTATION: Logan Webb, Jesus Luzardo, Jacob deGrom, Dylan Cease, Edwin Diaz, Michael King, Jack Flaherty
+PBENCH: Shota Imanaga
+REASONING: Mock pitcher rotation — starting all seven healthiest pitchers, benching Imanaga.
+"""
+
 MOCK_WAIVER_RESPONSE = """
 ADD: Brandon Lowe | DROP: Jazz Chisholm Jr. | REASON: Mock waiver claim
 """
@@ -187,6 +193,50 @@ Only use player names exactly as they appear above. Do not add any other text.
 """
 
 
+def build_pitcher_prompt(team) -> str:
+    pitcher_slots = {"SP", "RP", "P"}
+    pitchers = [p for p in team.roster if set(p.eligibleSlots) & pitcher_slots]
+
+    total_P_slots     = sum(1 for p in pitchers if p.lineupSlot in pitcher_slots)
+    total_bench_slots = len(pitchers) - total_P_slots
+
+    pitcher_lines = []
+    for p in pitchers:
+        roles  = [s for s in ["SP", "RP"] if s in p.eligibleSlots]
+        status = getattr(p, "injuryStatus", "ACTIVE")
+        healthy = "✓" if not p.injured else "✗"
+        pitcher_lines.append(
+            f"  {p.name:<25} role: {', '.join(roles):<8} healthy: {healthy}  status: {status}"
+        )
+    pitcher_table = "\n".join(pitcher_lines)
+    stats = [serialize_player(p) for p in pitchers]
+
+    return f"""
+{GM_PERSONA}
+
+Today is {date.today().strftime('%A, %B %d, %Y')}.
+League format: Head-to-Head Points
+
+You have {total_P_slots} active pitcher slots and {total_bench_slots} bench spots.
+
+Pitchers on your roster:
+{pitcher_table}
+
+Full pitcher stats (for reference):
+{json.dumps(stats, indent=2)}
+
+Task: Choose exactly {total_P_slots} pitchers for the active rotation and exactly {total_bench_slots} to bench.
+Prefer SP that are projected to start today, otherwise select RP. Prioritize healthy pitchers with strong recent stats and projected points.
+
+Respond with exactly this structure and nothing else:
+ROTATION: Player Name, Player Name, ... (exactly {total_P_slots} names)
+PBENCH: Player Name, Player Name, ... (exactly {total_bench_slots} names)
+REASONING: One or two sentences explaining the key decisions.
+
+Only use player names exactly as they appear above. Do not add any other text.
+"""
+
+
 def build_waiver_prompt(team, league) -> str:
     pitcher_slots = {"SP", "RP", "P"}
     hitters       = [p for p in team.roster if not set(p.eligibleSlots) & pitcher_slots]
@@ -259,7 +309,12 @@ def ask_gemini(prompt: str, mode: str = "lineup", retries: int = 3) -> str:
     On other errors, falls back to a simple 10/20/30s backoff.
     """
     if not USE_LLM:
-        mock = MOCK_LINEUP_RESPONSE if mode == "lineup" else MOCK_WAIVER_RESPONSE
+        if mode == "lineup":
+            mock = MOCK_LINEUP_RESPONSE
+        elif mode == "pitchers":
+            mock = MOCK_PITCHER_RESPONSE
+        else:
+            mock = MOCK_WAIVER_RESPONSE
         print(f"🧪 USE_LLM=False — using mock {mode} response")
         return mock.strip()
 
@@ -297,13 +352,17 @@ def ask_gemini(prompt: str, mode: str = "lineup", retries: int = 3) -> str:
 
 def parse_lineup_response(raw: str) -> dict:
     """Parse Gemini's plain-text lineup response into a structured dict."""
-    result = {"active": [], "bench": [], "reasoning": ""}
+    result = {"active": [], "bench": [], "rotation": [], "pbench": [], "reasoning": ""}
     for line in raw.splitlines():
         line = line.strip()
         if line.upper().startswith("ACTIVE:"):
             result["active"] = [n.strip() for n in line[7:].split(",") if n.strip()]
         elif line.upper().startswith("BENCH:"):
             result["bench"] = [n.strip() for n in line[6:].split(",") if n.strip()]
+        elif line.upper().startswith("ROTATION:"):
+            result["rotation"] = [n.strip() for n in line[9:].split(",") if n.strip()]
+        elif line.upper().startswith("PBENCH:"):
+            result["pbench"] = [n.strip() for n in line[7:].split(",") if n.strip()]
         elif line.upper().startswith("REASONING:"):
             result["reasoning"] = line[10:].strip()
     return result
@@ -394,17 +453,18 @@ def _submit(items: list[dict], scoring_period: int, label: str = ""):
     espn_set_lineup(items, scoring_period)
 
 
-def apply_lineup(team, league, raw_response: str):
+def apply_lineup(team, league, raw_response: str, raw_pitcher_response: str):
     """Apply lineup decisions in three ordered phases to avoid slot conflicts.
 
     Phase 1 — Bench outgoing players first, freeing active slots.
     Phase 2 — Reposition active players who need a different slot
               (e.g. Jazz 2B→3B). Uses BE as a waypoint for triangular swaps.
     Phase 3 — Promote bench players into the newly freed active slots.
-    Pitcher pass — Ensure only today's starters occupy P slots; swap in
-              non-starting pitchers from the bench to replace any starters
-              who are not pitching today.
+    Pitcher pass — Apply LLM pitcher rotation decision: bench non-selected
+              pitchers first, then promote selected starters into P slots.
     """
+
+
     decision    = parse_lineup_response(raw_response)
     bench_names = set(decision["bench"])
     # ACTIVE list from the LLM covers hitters only — pitchers are handled
@@ -423,27 +483,30 @@ def apply_lineup(team, league, raw_response: str):
         return bool(set(player.eligibleSlots) & pitcher_slots)
     
     total_OF_slots = HITTER_SLOTS.count("OF")
+    total_P_slots  = sum(1 for slot in current_slot_by_name.values() if slot in pitcher_slots)
 
-    def find_open_slot(player, occupied: set[str]) -> str | None:
-        # Count how many OF slots are already occupied in the current assignment
-        of_used = occupied.count("OF") if hasattr(occupied, "count") else sum(1 for s in occupied if s == "OF")
+    def find_open_slot(player, occupied: list[str]) -> str | None:
+        of_used = sum(1 for s in occupied if s == "OF")
+        p_used  = sum(1 for s in occupied if s in pitcher_slots)
         for slot in SLOT_PRIORITY:
             if slot not in player.eligibleSlots:
                 continue
             if slot == "OF":
-                # OF can be occupied multiple times up to total_OF_slots
                 if of_used < total_OF_slots:
+                    return slot
+            elif slot in pitcher_slots:
+                if p_used < total_P_slots:
                     return slot
             elif slot not in occupied:
                 return slot
         return None
 
 
-    # Track which active slots are occupied as we go
-    occupied: set[str] = {
+    # Track which active slots are occupied as we go (list to allow duplicate slot names)
+    occupied: list[str] = [
         slot for name, slot in current_slot_by_name.items()
         if slot in active_slots
-    }
+    ]
 
 
     # ── Phase 1: bench outgoing hitters ────────────────────────────────────
@@ -457,7 +520,8 @@ def apply_lineup(team, league, raw_response: str):
         if from_slot == "BE":
             continue  # already benched
         phase1.append(_make_move(player, from_slot, "BE"))
-        occupied.discard(from_slot)
+        try: occupied.remove(from_slot)
+        except ValueError: pass
         current_slot_by_name[name] = "BE"
         print(f"   {name}: {from_slot} → BE")
     _submit(phase1, scoring_period, "bench outgoing")
@@ -471,7 +535,11 @@ def apply_lineup(team, league, raw_response: str):
             continue
         current = current_slot_by_name.get(name, "BE")
         # Determine best target slot for this player
-        target = find_open_slot(player, occupied - ({current} if current != "BE" else set()))
+        temp_occupied = list(occupied)
+        if current != "BE":
+            try: temp_occupied.remove(current)
+            except ValueError: pass
+        target = find_open_slot(player, temp_occupied)
         if target is None:
             print(f"⚠️  No open slot for {name}, leaving on bench.")
             continue
@@ -485,8 +553,9 @@ def apply_lineup(team, league, raw_response: str):
         else:
             phase2.append(_make_move(player, current, target))
             print(f"   {name}: {current} → {target}")
-        occupied.discard(current)
-        occupied.add(target)
+        try: occupied.remove(current)
+        except ValueError: pass
+        occupied.append(target)
         current_slot_by_name[name] = target
     _submit(phase2, scoring_period, "reposition active")
 
@@ -504,7 +573,7 @@ def apply_lineup(team, league, raw_response: str):
             print(f"⚠️  No open slot for {name}, leaving on bench.")
             continue
         phase3.append(_make_move(player, "BE", target))
-        occupied.add(target)
+        occupied.append(target)
         current_slot_by_name[name] = target
         print(f"   {name}: BE → {target}")
     _submit(phase3, scoring_period, "promote from bench")
@@ -513,14 +582,10 @@ def apply_lineup(team, league, raw_response: str):
     print("Pitcher pass: optimising P slots...")
     pitchers = [p for p in team.roster if is_pitcher(p)]
 
-    # A pitcher is "starting today" if their proTeamId appears as the home/away
-    # starter — use the injuryStatus field as a proxy: ESPN marks non-starters
-    # as "DTDAY" or similar, but the most reliable signal available without a
-    # separate schedule API call is whether the player has a game today
-    # (p.injured == False and status == "ACTIVE"). Flag starters vs non-starters:
-    starters     = [p for p in pitchers if not p.injured and
-                    getattr(p, "injuryStatus", "ACTIVE") == "ACTIVE"]
-    non_starters = [p for p in pitchers if p not in starters]
+    pitcher_decision = parse_lineup_response(raw_pitcher_response)
+    starter_names    = set(pitcher_decision["rotation"])
+    starters     = [p for p in pitchers if p.name in starter_names]
+    non_starters = [p for p in pitchers if p.name not in starter_names]
 
     # Bench any non-starters currently in active P slots
     pitcher_phase1 = []
@@ -528,7 +593,8 @@ def apply_lineup(team, league, raw_response: str):
         slot = current_slot_by_name.get(p.name, "BE")
         if slot != "BE":
             pitcher_phase1.append(_make_move(p, slot, "BE"))
-            occupied.discard(slot)
+            try: occupied.remove(slot)
+            except ValueError: pass
             current_slot_by_name[p.name] = "BE"
             print(f"   {p.name}: {slot} → BE (not starting)")
     _submit(pitcher_phase1, scoring_period, "bench non-starting pitchers")
@@ -540,7 +606,7 @@ def apply_lineup(team, league, raw_response: str):
             target = find_open_slot(p, occupied)
             if target:
                 pitcher_phase2.append(_make_move(p, "BE", target))
-                occupied.add(target)
+                occupied.append(target)
                 current_slot_by_name[p.name] = target
                 print(f"   {p.name}: BE → {target} (starting today)")
             else:
@@ -670,11 +736,16 @@ def run(mode: str = "all"):
         time.sleep(15)
     
     if mode in ("lineup", "all"):
+        print("🧠 Asking Gemini for pitcher rotation...")
+        pitcher_prompt    = build_pitcher_prompt(team)
+        pitcher_response  = ask_gemini(pitcher_prompt, mode="pitchers")
+        print(pitcher_response)
+
         print("🧠 Asking Gemini for lineup decisions...")
         lineup_prompt    = build_lineup_prompt(team, league)
         lineup_response  = ask_gemini(lineup_prompt, mode="lineup")
         print(lineup_response)
-        apply_lineup(team, league, lineup_response)
+        apply_lineup(team, league, lineup_response, pitcher_response)
 
 
 
