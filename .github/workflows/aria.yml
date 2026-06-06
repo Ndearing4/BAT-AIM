@@ -39,10 +39,10 @@ jobs:
             # Determine mode based on which cron triggered
             HOUR=$(date -u +%H)
             if [ "$HOUR" = "11" ]; then
-              python src/ai_manager.py waivers
+              python src/main.py waivers
             else
-              python src/ai_manager.py lineup
+              python src/main.py lineup
             fi
           else
-            python src/ai_manager.py ${{ github.event.inputs.mode }}
+            python src/main.py ${{ github.event.inputs.mode }}
           fi
